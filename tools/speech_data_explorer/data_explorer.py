@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import functools
 import argparse
 import base64
 import csv
@@ -82,6 +83,9 @@ def parse_args():
     parser.add_argument(
         'manifest', help='path to JSON manifest file',
     )
+    parser.add_argument(
+        '-mp','--model_pred_columns', action='append', help='if predictions not in pred_text give column names',
+    )
     parser.add_argument('--vocab', help='optional vocabulary to highlight OOV words')
     parser.add_argument('--port', default='8050', help='serving port for establishing connection')
     parser.add_argument(
@@ -128,7 +132,7 @@ def eval_bandwidth(signal, sr, threshold=-50):
 
 
 # load data from JSON manifest file
-def load_data(data_filename, disable_caching=False, estimate_audio=False, vocab=None, audio_base_path=None):
+def load_data(data_filename, model_list=False,disable_caching=False, estimate_audio=False, vocab=None, audio_base_path=None):
 
     if vocab is not None:
         # load external vocab
@@ -161,13 +165,17 @@ def load_data(data_filename, disable_caching=False, estimate_audio=False, vocab=
                     bw = eval_bandwidth(signal, sr)
                     item['freq_bandwidth'] = int(bw)
                     item['level_db'] = 20 * np.log10(np.max(np.abs(signal)))
+            if model_list:
+                a=[]
+                a=list(model_list)
+                print(a)
             with open(pickle_filename, 'wb') as f:
                 pickle.dump(
                     [data, wer, cer, wmr, mwa, num_hours, vocabulary_data, alphabet, metrics_available],
                     f,
                     pickle.HIGHEST_PROTOCOL,
                 )
-            return data, wer, cer, wmr, mwa, num_hours, vocabulary_data, alphabet, metrics_available
+            return data, a, wer, cer, wmr, mwa, num_hours, vocabulary_data, alphabet, metrics_available
 
     data = []
     wer_dist = 0.0
@@ -201,22 +209,24 @@ def load_data(data_filename, disable_caching=False, estimate_audio=False, vocab=
             num_hours += item['duration']
 
             if 'pred_text' in item:
-                metrics_available = True
-                pred = item['pred_text'].split()
-                measures = jiwer.compute_measures(item['text'], item['pred_text'])
-                word_dist = measures['substitutions'] + measures['insertions'] + measures['deletions']
-                char_dist = editdistance.eval(item['text'], item['pred_text'])
-                wer_dist += word_dist
-                cer_dist += char_dist
-                wer_count += num_words
-                cer_count += num_chars
+                try:
+                    metrics_available = True
+                    pred = item['pred_text'].split()
+                    measures = jiwer.compute_measures(item['text'], item['pred_text'])
+                    word_dist = measures['substitutions'] + measures['insertions'] + measures['deletions']
+                    char_dist = editdistance.eval(item['text'], item['pred_text'])
+                    wer_dist += word_dist
+                    cer_dist += char_dist
+                    wer_count += num_words
+                    cer_count += num_chars
 
-                sm.set_seqs(orig, pred)
-                for m in sm.get_matching_blocks():
-                    for word_idx in range(m[0], m[0] + m[2]):
-                        match_vocab[orig[word_idx]] += 1
-                wmr_count += measures['hits']
-
+                    sm.set_seqs(orig, pred)
+                    for m in sm.get_matching_blocks():
+                        for word_idx in range(m[0], m[0] + m[2]):
+                            match_vocab[orig[word_idx]] += 1
+                    wmr_count += measures['hits']
+                except:
+                    pass
             data.append(
                 {
                     'audio_filepath': item['audio_filepath'],
@@ -351,8 +361,8 @@ def absolute_audio_filepath(audio_filepath, audio_base_path):
 args = parse_args()
 
 print('Loading data...')
-data, wer, cer, wmr, mwa, num_hours, vocabulary, alphabet, metrics_available = load_data(
-    args.manifest, args.disable_caching_metrics, args.estimate_audio_metrics, args.vocab, args.audio_base_path
+data, preds, wer, cer, wmr, mwa, num_hours, vocabulary, alphabet, metrics_available = load_data(
+    args.manifest, args.model_pred_columns, args.disable_caching_metrics, args.estimate_audio_metrics, args.vocab, args.audio_base_path
 )
 print('Starting server...')
 app = dash.Dash(
@@ -669,8 +679,29 @@ if metrics_available:
                     class_name='mt-1 bg-light font-monospace text-break small rounded border',
                 ),
             ]
-        )
-    ]
+        )]
+    for i in range(len(preds)):
+        samples_layout += [    
+        dbc.Row(
+        [
+            dbc.Col(
+                html.Div(children='text diff '+str(preds[i])),
+                width=2,
+                class_name='mt-1 bg-light font-monospace text-break small rounded border',
+            ),
+            dbc.Col(
+                html.Iframe(
+                    id='_diff_'+str(preds[i]),
+                    sandbox='',
+                    srcDoc='',
+                    style={'border': 'none', 'width': '100%', 'height': '100%'},
+                    className='bg-light font-monospace text-break small',
+                ),
+                class_name='mt-1 bg-light font-monospace text-break small rounded border',
+            ),
+        ]
+    )
+]
 samples_layout += [
     dbc.Row(dbc.Col(html.Audio(id='player', controls=True),), class_name='mt-3 '),
     dbc.Row(dbc.Col(dcc.Graph(id='signal-graph')), class_name='mt-3'),
@@ -741,7 +772,6 @@ def show_item(idx, data):
         raise PreventUpdate
     return [data[idx[0]][k] for k in data[0]]
 
-
 @app.callback(Output('_diff', 'srcDoc'), [Input('datatable', 'selected_rows'), Input('datatable', 'data')])
 def show_diff(idx, data):
     if len(idx) == 0:
@@ -765,6 +795,37 @@ def show_diff(idx, data):
     diff_html = diff.diff_prettyHtml(diffs_post)
 
     return diff_html
+def create_callback(j, preds):
+    def show_diff(idx, data):
+        if len(idx) == 0:
+            raise PreventUpdate
+        print(j)
+        orig_words = data[idx[0]]['text']
+        orig_words = '\n'.join(orig_words.split()) + '\n'
+
+        pred_words = data[idx[0]][preds[j]]
+        pred_words = '\n'.join(pred_words.split()) + '\n'
+
+        diff = diff_match_patch.diff_match_patch()
+        diff.Diff_Timeout = 0
+        orig_enc, pred_enc, enc = diff.diff_linesToChars(orig_words, pred_words)
+        diffs = diff.diff_main(orig_enc, pred_enc, False)
+        diff.diff_charsToLines(diffs, enc)
+        diffs_post = []
+        for d in diffs:
+            diffs_post.append((d[0], d[1].replace('\n', ' ')))
+
+        diff_html = diff.diff_prettyHtml(diffs_post)
+
+        return diff_html
+
+    return show_diff
+for j in range(len(preds)):
+    print(j)
+    app.callback(
+        Output('_diff_' + str(preds[j]), 'srcDoc'),
+        [Input('datatable', 'selected_rows'), Input('datatable', 'data')]
+    )(functools.partial(create_callback(j, preds)))
 
 
 @app.callback(Output('signal-graph', 'figure'), [Input('datatable', 'selected_rows'), Input('datatable', 'data')])
